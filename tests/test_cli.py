@@ -31,3 +31,9 @@ def test_no_command_prints_help(capsys) -> None:
     assert "login" in out
     assert "list" in out
     assert "download" in out
+
+
+def test_download_requires_exactly_one_selection(capsys) -> None:
+    assert main(["download"]) == 2
+    err = capsys.readouterr().err
+    assert "exactly one" in err

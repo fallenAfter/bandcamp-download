@@ -19,8 +19,17 @@ from bcdl.auth import (
     parse_identity,
     save_identity,
 )
-from bcdl.collection import fetch_collection, filter_items, save_collection
+from bcdl.collection import (
+    fetch_collection,
+    filter_items,
+    find_by_id,
+    find_by_url,
+    load_or_fetch_collection,
+    save_collection,
+)
 from bcdl.config import DEFAULT_FORMAT, KNOWN_FORMATS
+from bcdl.download import download_item
+from bcdl.manifest import record_download
 from bcdl.session import BandcampError, Client, whoami
 
 
@@ -186,9 +195,48 @@ def cmd_list(args: argparse.Namespace) -> int:
         return 1
 
 
-def cmd_download(_args: argparse.Namespace) -> int:
-    print("download is not implemented yet", file=sys.stderr)
-    return 1
+def cmd_download(args: argparse.Namespace) -> int:
+    if len(args.urls) + len(args.ids) != 1:
+        print(
+            "Specify exactly one album URL or --id (batch downloads come next).",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        identity = load_identity()
+        dest_dir = Path(args.output).expanduser() if args.output else Path.cwd()
+        with Client(identity) as client:
+            items = load_or_fetch_collection(client)
+            if args.urls:
+                item = find_by_url(items, args.urls[0])
+                if item is None:
+                    print(
+                        f"Not in your collection: {args.urls[0]}\n"
+                        "Run `bcdl list` and use a purchased album URL.",
+                        file=sys.stderr,
+                    )
+                    return 1
+            else:
+                item = find_by_id(items, args.ids[0])
+                if item is None:
+                    print(f"No collection item with id {args.ids[0]}", file=sys.stderr)
+                    return 1
+            print(f"Downloading {item.band_name} — {item.item_title} ({args.format})")
+            path, fmt = download_item(
+                client, item, dest_dir, preferred_format=args.format
+            )
+        record_download(
+            item.key,
+            artist=item.band_name,
+            title=item.item_title,
+            fmt=fmt,
+            path=str(path),
+        )
+        print(f"Saved {path} [{fmt}]")
+        return 0
+    except (AuthError, BandcampError, OSError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
 
 
 def main(argv: Sequence[str] | None = None) -> int:
