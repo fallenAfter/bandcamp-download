@@ -3,7 +3,6 @@ import json
 from pathlib import Path
 
 import httpx
-import pytest
 
 from bcdl.collection import Item, find_by_id, find_by_url, normalize_item_url
 from bcdl.download import (
@@ -134,7 +133,7 @@ def test_download_item_writes_zip(tmp_path: Path) -> None:
     dest, fmt = download_item(client, item, tmp_path, preferred_format="flac")
     assert fmt == "flac"
     assert dest.read_bytes() == payload
-    assert dest.name == "Artist - Album.zip"
+    assert dest.name == "Artist - Album [flac].zip"
 
 
 def test_resolve_cdn_url_https_prefix() -> None:
@@ -148,3 +147,66 @@ def test_resolve_cdn_url_https_prefix() -> None:
         client, "https://popplers5.bandcamp.com/download/album?enc=flac"
     )
     assert url == "https://p4.bcbits.com/x.zip"
+
+
+def test_stream_resumes_partial_file(tmp_path: Path) -> None:
+    from bcdl.download import stream_to_file
+
+    body = b"ABCDEFGH"
+    dest = tmp_path / "album.zip"
+    part = tmp_path / "album.zip.part"
+    part.write_bytes(body[:3])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("range") == "bytes=3-"
+        return httpx.Response(
+            206,
+            content=body[3:],
+            headers={"content-length": "5"},
+        )
+
+    client = Client("token", http=httpx.Client(transport=httpx.MockTransport(handler)))
+    stream_to_file(client, "https://p4.bcbits.com/album.zip", dest)
+    assert dest.read_bytes() == body
+    assert not part.exists()
+
+
+def test_download_retries_then_succeeds(tmp_path: Path) -> None:
+    format_url = "https://popplers5.bandcamp.com/download/album?enc=flac&id=1"
+    cdn_url = "https://p4.bcbits.com/download/album.zip"
+    payload = b"PK\x03\x04 ok"
+    calls = {"cdn": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/download":
+            return httpx.Response(200, text=_download_html(format_url))
+        if path.startswith("/statdownload/"):
+            return httpx.Response(200, text=json.dumps({"retry_url": cdn_url}))
+        if path.endswith("album.zip"):
+            calls["cdn"] += 1
+            if calls["cdn"] == 1:
+                return httpx.Response(500, text="nope")
+            return httpx.Response(
+                200,
+                content=payload,
+                headers={"content-length": str(len(payload))},
+            )
+        return httpx.Response(404, text=str(request.url))
+
+    item = Item(
+        1,
+        "p",
+        "Artist",
+        "Album",
+        "album",
+        "https://artist.bandcamp.com/album/album",
+        "https://bandcamp.com/download?id=1",
+    )
+    client = Client("token", http=httpx.Client(transport=httpx.MockTransport(handler)))
+    dest, fmt = download_item(
+        client, item, tmp_path, preferred_format="flac", retries=2, retry_wait=0
+    )
+    assert fmt == "flac"
+    assert dest.read_bytes() == payload
+    assert calls["cdn"] == 2

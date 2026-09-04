@@ -6,6 +6,7 @@ import argparse
 import getpass
 import json
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -22,14 +23,14 @@ from bcdl.auth import (
 from bcdl.collection import (
     fetch_collection,
     filter_items,
-    find_by_id,
-    find_by_url,
     load_or_fetch_collection,
+    parse_targets_file,
+    resolve_targets,
     save_collection,
 )
-from bcdl.config import DEFAULT_FORMAT, KNOWN_FORMATS
-from bcdl.download import download_item
-from bcdl.manifest import record_download
+from bcdl.config import DEFAULT_DELAY_SECONDS, DEFAULT_FORMAT, KNOWN_FORMATS
+from bcdl.download import album_filename, download_item
+from bcdl.manifest import is_downloaded, record_download
 from bcdl.session import BandcampError, Client, whoami
 
 
@@ -120,6 +121,38 @@ def build_parser() -> argparse.ArgumentParser:
         choices=KNOWN_FORMATS,
         help="Preferred audio format (default: flac)",
     )
+    download.add_argument(
+        "--file",
+        dest="from_file",
+        metavar="FILE",
+        type=Path,
+        help="Text file of album URLs or item ids (one per line)",
+    )
+    download.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download even if the album is in the manifest or already on disk",
+    )
+    download.add_argument(
+        "--delay",
+        type=float,
+        default=DEFAULT_DELAY_SECONDS,
+        metavar="SECONDS",
+        help=f"Wait between albums (default: {DEFAULT_DELAY_SECONDS:g})",
+    )
+    download.add_argument(
+        "--retries",
+        type=int,
+        default=5,
+        help="Attempts per album after a failure (default: 5)",
+    )
+    download.add_argument(
+        "--retry-wait",
+        type=float,
+        default=5.0,
+        metavar="SECONDS",
+        help="Wait after a failed attempt (default: 5)",
+    )
     download.set_defaults(func=cmd_download)
 
     return parser
@@ -196,43 +229,77 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_download(args: argparse.Namespace) -> int:
-    if len(args.urls) + len(args.ids) != 1:
+    if args.delay < 0:
+        print("--delay must be >= 0", file=sys.stderr)
+        return 2
+    if args.retries < 1:
+        print("--retries must be >= 1", file=sys.stderr)
+        return 2
+
+    urls = list(args.urls)
+    ids = list(args.ids)
+    if args.from_file is not None:
+        try:
+            file_urls, file_ids = parse_targets_file(args.from_file)
+        except OSError as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        urls.extend(file_urls)
+        ids.extend(file_ids)
+    if not urls and not ids:
         print(
-            "Specify exactly one album URL or --id (batch downloads come next).",
+            "Specify album URL(s), --id, and/or --file with one target per line.",
             file=sys.stderr,
         )
         return 2
+
     try:
         identity = load_identity()
         dest_dir = Path(args.output).expanduser() if args.output else Path.cwd()
+        failures = 0
+        downloaded = 0
         with Client(identity) as client:
-            items = load_or_fetch_collection(client)
-            if args.urls:
-                item = find_by_url(items, args.urls[0])
-                if item is None:
-                    print(
-                        f"Not in your collection: {args.urls[0]}\n"
-                        "Run `bcdl list` and use a purchased album URL.",
-                        file=sys.stderr,
+            catalog = load_or_fetch_collection(client)
+            selected, missing = resolve_targets(catalog, urls, ids)
+            for label in missing:
+                print(f"Not in your collection: {label}", file=sys.stderr)
+                failures += 1
+            pending = len(selected)
+            for index, item in enumerate(selected):
+                label = f"{item.band_name} — {item.item_title}"
+                dest = dest_dir / album_filename(item, args.format)
+                if not args.force and (is_downloaded(item.key) or dest.exists()):
+                    print(f"Skipping {label} (already downloaded)")
+                    continue
+                print(f"Downloading {label} ({args.format})")
+                try:
+                    path, fmt = download_item(
+                        client,
+                        item,
+                        dest_dir,
+                        preferred_format=args.format,
+                        retries=args.retries,
+                        retry_wait=args.retry_wait,
                     )
-                    return 1
-            else:
-                item = find_by_id(items, args.ids[0])
-                if item is None:
-                    print(f"No collection item with id {args.ids[0]}", file=sys.stderr)
-                    return 1
-            print(f"Downloading {item.band_name} — {item.item_title} ({args.format})")
-            path, fmt = download_item(
-                client, item, dest_dir, preferred_format=args.format
-            )
-        record_download(
-            item.key,
-            artist=item.band_name,
-            title=item.item_title,
-            fmt=fmt,
-            path=str(path),
-        )
-        print(f"Saved {path} [{fmt}]")
+                except (BandcampError, OSError) as exc:
+                    print(f"Failed {label}: {exc}", file=sys.stderr)
+                    failures += 1
+                    continue
+                record_download(
+                    item.key,
+                    artist=item.band_name,
+                    title=item.item_title,
+                    fmt=fmt,
+                    path=str(path),
+                )
+                print(f"Saved {path} [{fmt}]")
+                downloaded += 1
+                remaining = pending - index - 1
+                if remaining and args.delay:
+                    time.sleep(args.delay)
+        if failures:
+            print(f"Finished with {failures} failure(s), {downloaded} downloaded.")
+            return 1
         return 0
     except (AuthError, BandcampError, OSError) as exc:
         print(exc, file=sys.stderr)

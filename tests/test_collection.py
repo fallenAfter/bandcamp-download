@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -13,6 +14,8 @@ from bcdl.collection import (
     filter_items,
     item_from_json,
     load_collection,
+    parse_targets_file,
+    resolve_targets,
     save_collection,
 )
 from bcdl.session import Client, parse_pagedata
@@ -68,6 +71,34 @@ def test_filter_and_cache(tmp_path, monkeypatch) -> None:
     loaded = load_collection()
     assert [i.key for i in loaded] == ["p1", "p2"]
     assert [i.band_name for i in filter_items(loaded, "beta")] == ["Beta"]
+
+
+def test_parse_targets_file(tmp_path: Path) -> None:
+    path = tmp_path / "albums.txt"
+    path.write_text(
+        "# comment\n"
+        "https://a.bandcamp.com/album/one\n"
+        "\n"
+        "p2\n"
+        "3\n"
+    )
+    urls, ids = parse_targets_file(path)
+    assert urls == ["https://a.bandcamp.com/album/one"]
+    assert ids == ["p2", "3"]
+
+
+def test_resolve_targets_dedupes_and_reports_missing() -> None:
+    items = [
+        Item(1, "p", "Alpha", "One", "album", "https://a.bandcamp.com/album/one", "u1"),
+        Item(2, "p", "Beta", "Two", "album", "https://b.bandcamp.com/album/two", "u2"),
+    ]
+    found, missing = resolve_targets(
+        items,
+        urls=["https://a.bandcamp.com/album/one", "https://missing.bandcamp.com/album/x"],
+        ids=["p1", "p2"],
+    )
+    assert [i.key for i in found] == ["p1", "p2"]
+    assert missing == ["https://missing.bandcamp.com/album/x"]
 
 
 def test_fetch_collection_paginates() -> None:

@@ -189,3 +189,43 @@ def find_by_id(items: list[Item], value: str) -> Item | None:
         if item.key == value or str(item.sale_item_id) == value:
             return item
     return None
+
+
+def parse_targets_file(path: Path) -> tuple[list[str], list[str]]:
+    """Return (urls, ids) from a text file. Blank lines and # comments are ignored."""
+    urls: list[str] = []
+    ids: list[str] = []
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("http://") or line.startswith("https://"):
+            urls.append(line)
+        else:
+            ids.append(line)
+    return urls, ids
+
+
+def resolve_targets(
+    items: list[Item],
+    urls: list[str],
+    ids: list[str],
+) -> tuple[list[Item], list[str]]:
+    found: list[Item] = []
+    seen: set[str] = set()
+    missing: list[str] = []
+
+    def add(item: Item | None, label: str) -> None:
+        if item is None:
+            missing.append(label)
+            return
+        if item.key in seen:
+            return
+        seen.add(item.key)
+        found.append(item)
+
+    for url in urls:
+        add(find_by_url(items, url), url)
+    for value in ids:
+        add(find_by_id(items, value), value)
+    return found, missing
