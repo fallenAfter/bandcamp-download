@@ -1,0 +1,159 @@
+"""Fetch and cache the logged-in fan's Bandcamp purchases."""
+
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+from bcdl.config import config_dir, ensure_config_dir
+from bcdl.session import (
+    COLLECTION_ITEMS_URL,
+    BandcampError,
+    Client,
+    dotted,
+)
+
+CACHE_FILE = "collection.json"
+PAGE_SIZE = 50
+
+
+@dataclass(frozen=True)
+class Item:
+    sale_item_id: int
+    sale_item_type: str
+    band_name: str
+    item_title: str
+    item_type: str
+    item_url: str
+    download_page_url: str | None
+    hidden: bool = False
+    is_preorder: bool = False
+
+    @property
+    def key(self) -> str:
+        return f"{self.sale_item_type}{self.sale_item_id}"
+
+    @property
+    def downloadable(self) -> bool:
+        return self.download_page_url is not None
+
+    def matches(self, query: str) -> bool:
+        needle = query.casefold()
+        haystack = f"{self.band_name} {self.item_title} {self.item_url}".casefold()
+        return needle in haystack
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["key"] = self.key
+        return data
+
+
+def cache_path() -> Path:
+    return config_dir() / CACHE_FILE
+
+
+def item_from_json(raw: dict[str, Any], redownload_urls: dict[str, str]) -> Item:
+    sale_item_id = dotted(raw, "sale_item_id", required=True)
+    sale_item_type = dotted(raw, "sale_item_type", default="p") or "p"
+    key = f"{sale_item_type}{sale_item_id}"
+    return Item(
+        sale_item_id=int(sale_item_id),
+        sale_item_type=str(sale_item_type),
+        band_name=str(dotted(raw, "band_name", default="") or ""),
+        item_title=str(dotted(raw, "item_title", default="") or ""),
+        item_type=str(dotted(raw, "item_type", default="") or ""),
+        item_url=str(dotted(raw, "item_url", default="") or ""),
+        download_page_url=redownload_urls.get(key),
+        hidden=bool(dotted(raw, "hidden", default=False)),
+        is_preorder=bool(dotted(raw, "is_preorder", default=False)),
+    )
+
+
+def save_collection(items: list[Item]) -> Path:
+    path = ensure_config_dir() / CACHE_FILE
+    payload = {"items": [item.to_dict() for item in items]}
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+    return path
+
+
+def load_collection() -> list[Item]:
+    path = cache_path()
+    if not path.exists():
+        raise BandcampError(f"No cached collection at {path}. Run `bcdl list` first.")
+    data = json.loads(path.read_text())
+    items = []
+    for raw in data.get("items", []):
+        items.append(
+            Item(
+                sale_item_id=int(raw["sale_item_id"]),
+                sale_item_type=str(raw["sale_item_type"]),
+                band_name=str(raw.get("band_name") or ""),
+                item_title=str(raw.get("item_title") or ""),
+                item_type=str(raw.get("item_type") or ""),
+                item_url=str(raw.get("item_url") or ""),
+                download_page_url=raw.get("download_page_url"),
+                hidden=bool(raw.get("hidden", False)),
+                is_preorder=bool(raw.get("is_preorder", False)),
+            )
+        )
+    return items
+
+
+def fetch_collection(
+    client: Client,
+    *,
+    include_hidden: bool = False,
+    page_delay: float = 0.5,
+) -> list[Item]:
+    fan_id, username = client.whoami()
+    page = client.pagedata(f"https://bandcamp.com/{username}")
+
+    page_fan_id = dotted(page, "fan_data.fan_id", required=True)
+    me = dotted(page, "identities.fan.id")
+    if me is None:
+        raise BandcampError("Not logged in — no identity in page data.")
+    if int(me) != int(page_fan_id) or int(page_fan_id) != fan_id:
+        raise BandcampError("The collection page does not belong to the logged-in fan.")
+
+    coll = dotted(page, "collection_data", required=True)
+    total = int(dotted(coll, "item_count", default=0) or 0)
+    redownload = dotted(coll, "redownload_urls", default={}) or {}
+
+    items: list[Item] = []
+    cache = dotted(page, "item_cache.collection", default={}) or {}
+    for raw in cache.values():
+        items.append(item_from_json(raw, redownload))
+
+    token = dotted(coll, "last_token")
+    while token and len(items) < total:
+        payload = {
+            "fan_id": fan_id,
+            "older_than_token": token,
+            "count": PAGE_SIZE,
+        }
+        batch = client.post_json(COLLECTION_ITEMS_URL, payload)
+        page_redownload = dotted(batch, "redownload_urls", default={}) or {}
+        for raw in dotted(batch, "items", default=[]) or []:
+            items.append(item_from_json(raw, page_redownload))
+        if not dotted(batch, "more_available", default=False):
+            break
+        token = dotted(batch, "last_token")
+        if page_delay:
+            time.sleep(page_delay)
+
+    unique: dict[str, Item] = {}
+    for item in items:
+        unique.setdefault(item.key, item)
+    result = list(unique.values())
+    if not include_hidden:
+        result = [item for item in result if not item.hidden]
+    return result
+
+
+def filter_items(items: list[Item], query: str | None) -> list[Item]:
+    if not query:
+        return items
+    return [item for item in items if item.matches(query)]
