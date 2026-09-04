@@ -7,6 +7,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from bcdl.config import config_dir, ensure_config_dir
 from bcdl.session import (
@@ -102,6 +103,14 @@ def load_collection() -> list[Item]:
     return items
 
 
+def load_or_fetch_collection(client: Client, *, include_hidden: bool = True) -> list[Item]:
+    if cache_path().exists():
+        return load_collection()
+    items = fetch_collection(client, include_hidden=include_hidden)
+    save_collection(items)
+    return items
+
+
 def fetch_collection(
     client: Client,
     *,
@@ -157,3 +166,26 @@ def filter_items(items: list[Item], query: str | None) -> list[Item]:
     if not query:
         return items
     return [item for item in items if item.matches(query)]
+
+
+def normalize_item_url(url: str) -> str:
+    parsed = urlparse(url.strip())
+    host = parsed.netloc.lower().removeprefix("www.")
+    path = parsed.path.rstrip("/")
+    return f"{host}{path}".casefold()
+
+
+def find_by_url(items: list[Item], url: str) -> Item | None:
+    target = normalize_item_url(url)
+    for item in items:
+        if item.item_url and normalize_item_url(item.item_url) == target:
+            return item
+    return None
+
+
+def find_by_id(items: list[Item], value: str) -> Item | None:
+    value = value.strip()
+    for item in items:
+        if item.key == value or str(item.sale_item_id) == value:
+            return item
+    return None
