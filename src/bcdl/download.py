@@ -7,14 +7,15 @@ import random
 import re
 import time
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+import httpx
 
 from bcdl.collection import Item
 from bcdl.config import FORMAT_PREFERENCE
 from bcdl.session import BandcampError, Client, dotted
 
 UNSAFE_FILENAME = re.compile(r'[<>:"/\\|?*]')
-CONTENT_DISPOSITION_NAME = re.compile(r"filename\*=UTF-8''(.+)|filename=\"?([^\";]+)\"?", re.I)
 
 
 def format_order(preferred: str) -> tuple[str, ...]:
@@ -49,16 +50,6 @@ def album_filename(item: Item, fmt: str, extension: str = ".zip") -> str:
     if fmt:
         stem = f"{stem} [{fmt}]"
     return f"{stem}{extension}"
-
-
-def filename_from_disposition(header: str | None) -> str | None:
-    if not header:
-        return None
-    match = CONTENT_DISPOSITION_NAME.search(header)
-    if not match:
-        return None
-    value = match.group(1) or match.group(2)
-    return sanitize_filename(unquote(value))
 
 
 def to_stat_url(url: str) -> str:
@@ -99,38 +90,70 @@ def formats_for(client: Client, item: Item) -> dict[str, dict]:
     return dotted(download_items[0], "downloads", default={}) or {}
 
 
+def stream_to_file(client: Client, url: str, dest: Path) -> None:
+    """Write url to dest, resuming a sibling .part file when possible."""
+    part = dest.with_suffix(dest.suffix + ".part")
+    existing = part.stat().st_size if part.exists() else 0
+    headers: dict[str, str] = {}
+    if existing:
+        headers["Range"] = f"bytes={existing}-"
+
+    with client.http.stream("GET", url, headers=headers) as response:
+        if existing and response.status_code == 200:
+            existing = 0
+            part.unlink(missing_ok=True)
+        elif response.status_code not in (200, 206):
+            response.read()
+            raise BandcampError(f"Download failed: HTTP {response.status_code}")
+
+        length = response.headers.get("content-length")
+        exact_total: int | None = None
+        if length and length.isdigit():
+            exact_total = int(length) + existing
+
+        mode = "ab" if existing else "wb"
+        written = existing
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with part.open(mode) as fh:
+            for chunk in response.iter_bytes(chunk_size=64 * 1024):
+                fh.write(chunk)
+                written += len(chunk)
+
+    if exact_total is not None and written != exact_total:
+        raise BandcampError(
+            f"Incomplete download: got {written} of {exact_total} bytes. "
+            "Partial file kept; re-run to resume."
+        )
+    part.replace(dest)
+
+
 def download_item(
     client: Client,
     item: Item,
     dest_dir: Path,
     *,
     preferred_format: str,
+    retries: int = 5,
+    retry_wait: float = 5.0,
 ) -> tuple[Path, str]:
     if not item.downloadable:
         raise BandcampError(f"{item.band_name} — {item.item_title} is not downloadable")
-    available = formats_for(client, item)
-    fmt, entry = pick_format(available, preferred_format)
-    cdn_url = resolve_cdn_url(client, entry["url"])
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    default_name = album_filename(item, fmt)
-    dest = dest_dir / default_name
-
-    with client.http.stream("GET", cdn_url) as response:
-        if response.status_code >= 400:
-            raise BandcampError(f"Download failed: HTTP {response.status_code}")
-        header_name = filename_from_disposition(response.headers.get("content-disposition"))
-        if header_name:
-            dest = dest_dir / header_name
-        length = response.headers.get("content-length")
-        expected = int(length) if length and length.isdigit() else None
-        written = 0
-        with dest.open("wb") as fh:
-            for chunk in response.iter_bytes(chunk_size=64 * 1024):
-                fh.write(chunk)
-                written += len(chunk)
-        if expected is not None and written != expected:
-            dest.unlink(missing_ok=True)
-            raise BandcampError(
-                f"Incomplete download for {item.item_title}: got {written} of {expected} bytes"
-            )
-    return dest, fmt
+    last_error: Exception | None = None
+    attempts = max(1, retries)
+    for attempt in range(1, attempts + 1):
+        try:
+            available = formats_for(client, item)
+            fmt, entry = pick_format(available, preferred_format)
+            cdn_url = resolve_cdn_url(client, entry["url"])
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / album_filename(item, fmt)
+            stream_to_file(client, cdn_url, dest)
+            return dest, fmt
+        except (BandcampError, httpx.HTTPError, OSError) as exc:
+            last_error = exc
+            if attempt == attempts:
+                break
+            time.sleep(retry_wait)
+    raise BandcampError(
+        f"Giving up on {item.item_title} after {attempts} attempt(s): {last_error}"
+    ) from last_error
