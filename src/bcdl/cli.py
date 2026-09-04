@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -13,12 +14,14 @@ from bcdl.auth import (
     IDENTITY_ENV,
     AuthError,
     identity_from_env,
+    load_identity,
     parse_cookies_txt,
     parse_identity,
     save_identity,
 )
+from bcdl.collection import fetch_collection, filter_items, save_collection
 from bcdl.config import DEFAULT_FORMAT, KNOWN_FORMATS
-from bcdl.session import BandcampError, whoami
+from bcdl.session import BandcampError, Client, whoami
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -69,6 +72,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Print JSON instead of a table",
+    )
+    list_cmd.add_argument(
+        "--include-hidden",
+        action="store_true",
+        help="Include items hidden in your Bandcamp collection",
     )
     list_cmd.set_defaults(func=cmd_list)
 
@@ -145,9 +153,37 @@ def cmd_login(args: argparse.Namespace) -> int:
         return 1
 
 
-def cmd_list(_args: argparse.Namespace) -> int:
-    print("list is not implemented yet", file=sys.stderr)
-    return 1
+def cmd_list(args: argparse.Namespace) -> int:
+    try:
+        identity = load_identity()
+        with Client(identity) as client:
+            items = fetch_collection(client, include_hidden=args.include_hidden)
+        save_collection(items)
+        items = filter_items(items, args.search)
+        if args.json:
+            print(json.dumps([item.to_dict() for item in items], indent=2))
+            return 0
+        if not items:
+            print("No matching purchases.")
+            return 0
+        print(f"{'KEY':<12} {'TYPE':<8} ARTIST — TITLE")
+        for item in items:
+            flag = ""
+            if not item.downloadable:
+                flag = " (no download)"
+            elif item.is_preorder:
+                flag = " (preorder)"
+            print(
+                f"{item.key:<12} {item.item_type:<8} "
+                f"{item.band_name} — {item.item_title}{flag}"
+            )
+            if item.item_url:
+                print(f"{'':12} {item.item_url}")
+        print(f"\n{len(items)} item(s)")
+        return 0
+    except (AuthError, BandcampError, OSError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
 
 
 def cmd_download(_args: argparse.Namespace) -> int:
