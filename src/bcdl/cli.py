@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from bcdl import __version__
+from bcdl.auth import (
+    IDENTITY_ENV,
+    AuthError,
+    identity_from_env,
+    parse_cookies_txt,
+    parse_identity,
+    save_identity,
+)
 from bcdl.config import DEFAULT_FORMAT, KNOWN_FORMATS
+from bcdl.session import BandcampError, whoami
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,6 +37,22 @@ def build_parser() -> argparse.ArgumentParser:
     login = sub.add_parser(
         "login",
         help="Store your Bandcamp identity cookie",
+    )
+    login.add_argument(
+        "--identity",
+        metavar="VALUE",
+        help="identity cookie value (or set BANDCAMP_IDENTITY)",
+    )
+    login.add_argument(
+        "--cookies-txt",
+        metavar="FILE",
+        type=Path,
+        help="Netscape cookies.txt export from a browser extension",
+    )
+    login.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Save the cookie without checking it against Bandcamp",
     )
     login.set_defaults(func=cmd_login)
 
@@ -81,9 +108,41 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def cmd_login(_args: argparse.Namespace) -> int:
-    print("login is not implemented yet", file=sys.stderr)
-    return 1
+def _read_identity(args: argparse.Namespace) -> str:
+    if args.cookies_txt is not None:
+        return parse_cookies_txt(args.cookies_txt)
+    if args.identity:
+        return parse_identity(args.identity)
+    env_value = identity_from_env()
+    if env_value:
+        return env_value
+    print(
+        "Log in at https://bandcamp.com in your browser, then copy the "
+        "`identity` cookie:\n"
+        "  DevTools → Application/Storage → Cookies → https://bandcamp.com\n"
+        f"You can also set {IDENTITY_ENV} or pass --identity / --cookies-txt.\n"
+    )
+    try:
+        value = getpass.getpass("identity cookie: ")
+    except (EOFError, KeyboardInterrupt) as exc:
+        raise AuthError("No identity cookie provided.") from exc
+    return parse_identity(value)
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    try:
+        identity = _read_identity(args)
+        path = save_identity(identity)
+        if args.no_verify:
+            print(f"Saved session to {path}")
+            return 0
+        fan_id, username = whoami(identity)
+        print(f"Logged in as {username} (fan_id {fan_id})")
+        print(f"Saved session to {path}")
+        return 0
+    except (AuthError, BandcampError, OSError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
 
 
 def cmd_list(_args: argparse.Namespace) -> int:
