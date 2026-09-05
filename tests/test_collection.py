@@ -73,6 +73,18 @@ def test_filter_and_cache(tmp_path, monkeypatch) -> None:
     assert [i.band_name for i in filter_items(loaded, "beta")] == ["Beta"]
 
 
+def test_load_collection_rejects_corrupt_cache(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("BCDL_HOME", str(tmp_path))
+    from bcdl.collection import cache_path
+    from bcdl.config import ensure_config_dir
+    from bcdl.session import BandcampError
+
+    ensure_config_dir()
+    cache_path().write_text("{not json")
+    with pytest.raises(BandcampError, match="Could not parse"):
+        load_collection()
+
+
 def test_parse_targets_file(tmp_path: Path) -> None:
     path = tmp_path / "albums.txt"
     path.write_text(

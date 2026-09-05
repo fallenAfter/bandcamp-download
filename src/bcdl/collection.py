@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from bcdl.config import config_dir, ensure_config_dir
 from bcdl.session import (
     COLLECTION_ITEMS_URL,
+    HIDDEN_ITEMS_URL,
     BandcampError,
     Client,
     dotted,
@@ -84,37 +85,35 @@ def load_collection() -> list[Item]:
     path = cache_path()
     if not path.exists():
         raise BandcampError(f"No cached collection at {path}. Run `bcdl list` first.")
-    data = json.loads(path.read_text())
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise BandcampError(f"Could not parse collection cache at {path}") from exc
     items = []
-    for raw in data.get("items", []):
-        items.append(
-            Item(
-                sale_item_id=int(raw["sale_item_id"]),
-                sale_item_type=str(raw["sale_item_type"]),
-                band_name=str(raw.get("band_name") or ""),
-                item_title=str(raw.get("item_title") or ""),
-                item_type=str(raw.get("item_type") or ""),
-                item_url=str(raw.get("item_url") or ""),
-                download_page_url=raw.get("download_page_url"),
-                hidden=bool(raw.get("hidden", False)),
-                is_preorder=bool(raw.get("is_preorder", False)),
+    try:
+        for raw in data.get("items", []):
+            items.append(
+                Item(
+                    sale_item_id=int(raw["sale_item_id"]),
+                    sale_item_type=str(raw["sale_item_type"]),
+                    band_name=str(raw.get("band_name") or ""),
+                    item_title=str(raw.get("item_title") or ""),
+                    item_type=str(raw.get("item_type") or ""),
+                    item_url=str(raw.get("item_url") or ""),
+                    download_page_url=raw.get("download_page_url"),
+                    hidden=bool(raw.get("hidden", False)),
+                    is_preorder=bool(raw.get("is_preorder", False)),
+                )
             )
-        )
-    return items
-
-
-def load_or_fetch_collection(client: Client, *, include_hidden: bool = True) -> list[Item]:
-    if cache_path().exists():
-        return load_collection()
-    items = fetch_collection(client, include_hidden=include_hidden)
-    save_collection(items)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BandcampError(f"Collection cache at {path} is invalid") from exc
     return items
 
 
 def fetch_collection(
     client: Client,
     *,
-    include_hidden: bool = False,
+    include_hidden: bool = True,
     page_delay: float = 0.5,
 ) -> list[Item]:
     fan_id, username = client.whoami()
@@ -127,31 +126,29 @@ def fetch_collection(
     if int(me) != int(page_fan_id) or int(page_fan_id) != fan_id:
         raise BandcampError("The collection page does not belong to the logged-in fan.")
 
-    coll = dotted(page, "collection_data", required=True)
-    total = int(dotted(coll, "item_count", default=0) or 0)
-    redownload = dotted(coll, "redownload_urls", default={}) or {}
-
     items: list[Item] = []
-    cache = dotted(page, "item_cache.collection", default={}) or {}
-    for raw in cache.values():
-        items.append(item_from_json(raw, redownload))
-
-    token = dotted(coll, "last_token")
-    while token and len(items) < total:
-        payload = {
-            "fan_id": fan_id,
-            "older_than_token": token,
-            "count": PAGE_SIZE,
-        }
-        batch = client.post_json(COLLECTION_ITEMS_URL, payload)
-        page_redownload = dotted(batch, "redownload_urls", default={}) or {}
-        for raw in dotted(batch, "items", default=[]) or []:
-            items.append(item_from_json(raw, page_redownload))
-        if not dotted(batch, "more_available", default=False):
-            break
-        token = dotted(batch, "last_token")
-        if page_delay:
-            time.sleep(page_delay)
+    items.extend(
+        _page_items(
+            client,
+            fan_id,
+            dotted(page, "collection_data", required=True),
+            dotted(page, "item_cache.collection", default={}) or {},
+            COLLECTION_ITEMS_URL,
+            page_delay,
+        )
+    )
+    hidden_data = dotted(page, "hidden_data", default={}) or {}
+    if hidden_data:
+        items.extend(
+            _page_items(
+                client,
+                fan_id,
+                hidden_data,
+                dotted(page, "item_cache.hidden", default={}) or {},
+                HIDDEN_ITEMS_URL,
+                page_delay,
+            )
+        )
 
     unique: dict[str, Item] = {}
     for item in items:
@@ -160,6 +157,39 @@ def fetch_collection(
     if not include_hidden:
         result = [item for item in result if not item.hidden]
     return result
+
+
+def _page_items(
+    client: Client,
+    fan_id: int,
+    section: dict[str, Any],
+    cache: dict[str, Any],
+    endpoint: str,
+    page_delay: float,
+) -> list[Item]:
+    total = int(dotted(section, "item_count", default=0) or 0)
+    redownload = dotted(section, "redownload_urls", default={}) or {}
+    items: list[Item] = []
+    for raw in cache.values():
+        items.append(item_from_json(raw, redownload))
+
+    token = dotted(section, "last_token")
+    while token and len(items) < total:
+        payload = {
+            "fan_id": fan_id,
+            "older_than_token": token,
+            "count": PAGE_SIZE,
+        }
+        batch = client.post_json(endpoint, payload)
+        page_redownload = dotted(batch, "redownload_urls", default={}) or {}
+        for raw in dotted(batch, "items", default=[]) or []:
+            items.append(item_from_json(raw, page_redownload))
+        if not dotted(batch, "more_available", default=False):
+            break
+        token = dotted(batch, "last_token")
+        if page_delay:
+            time.sleep(page_delay)
+    return items
 
 
 def filter_items(items: list[Item], query: str | None) -> list[Item]:
@@ -179,6 +209,8 @@ def find_by_url(items: list[Item], url: str) -> Item | None:
     target = normalize_item_url(url)
     for item in items:
         if item.item_url and normalize_item_url(item.item_url) == target:
+            return item
+        if item.download_page_url and normalize_item_url(item.download_page_url) == target:
             return item
     return None
 

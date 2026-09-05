@@ -10,6 +10,8 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+import httpx
+
 from bcdl import __version__
 from bcdl.auth import (
     IDENTITY_ENV,
@@ -23,15 +25,16 @@ from bcdl.auth import (
 from bcdl.collection import (
     fetch_collection,
     filter_items,
-    load_or_fetch_collection,
     parse_targets_file,
     resolve_targets,
     save_collection,
 )
 from bcdl.config import DEFAULT_DELAY_SECONDS, DEFAULT_FORMAT, KNOWN_FORMATS
-from bcdl.download import album_filename, download_item
-from bcdl.manifest import is_downloaded, record_download
+from bcdl.download import download_item, existing_download
+from bcdl.manifest import record_download
 from bcdl.session import BandcampError, Client, whoami
+
+CLI_ERRORS = (AuthError, BandcampError, OSError, httpx.HTTPError, json.JSONDecodeError)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -144,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--retries",
         type=int,
         default=5,
-        help="Attempts per album after a failure (default: 5)",
+        help="Total attempts per album (default: 5)",
     )
     download.add_argument(
         "--retry-wait",
@@ -182,15 +185,16 @@ def _read_identity(args: argparse.Namespace) -> str:
 def cmd_login(args: argparse.Namespace) -> int:
     try:
         identity = _read_identity(args)
-        path = save_identity(identity)
         if args.no_verify:
+            path = save_identity(identity)
             print(f"Saved session to {path}")
             return 0
         fan_id, username = whoami(identity)
+        path = save_identity(identity)
         print(f"Logged in as {username} (fan_id {fan_id})")
         print(f"Saved session to {path}")
         return 0
-    except (AuthError, BandcampError, OSError) as exc:
+    except CLI_ERRORS as exc:
         print(exc, file=sys.stderr)
         return 1
 
@@ -199,8 +203,10 @@ def cmd_list(args: argparse.Namespace) -> int:
     try:
         identity = load_identity()
         with Client(identity) as client:
-            items = fetch_collection(client, include_hidden=args.include_hidden)
+            items = fetch_collection(client, include_hidden=True)
         save_collection(items)
+        if not args.include_hidden:
+            items = [item for item in items if not item.hidden]
         items = filter_items(items, args.search)
         if args.json:
             print(json.dumps([item.to_dict() for item in items], indent=2))
@@ -223,7 +229,7 @@ def cmd_list(args: argparse.Namespace) -> int:
                 print(f"{'':12} {item.item_url}")
         print(f"\n{len(items)} item(s)")
         return 0
-    except (AuthError, BandcampError, OSError) as exc:
+    except CLI_ERRORS as exc:
         print(exc, file=sys.stderr)
         return 1
 
@@ -259,7 +265,8 @@ def cmd_download(args: argparse.Namespace) -> int:
         failures = 0
         downloaded = 0
         with Client(identity) as client:
-            catalog = load_or_fetch_collection(client)
+            catalog = fetch_collection(client, include_hidden=True, page_delay=0.5)
+            save_collection(catalog)
             selected, missing = resolve_targets(catalog, urls, ids)
             for label in missing:
                 print(f"Not in your collection: {label}", file=sys.stderr)
@@ -267,9 +274,11 @@ def cmd_download(args: argparse.Namespace) -> int:
             pending = len(selected)
             for index, item in enumerate(selected):
                 label = f"{item.band_name} — {item.item_title}"
-                dest = dest_dir / album_filename(item, args.format)
-                if not args.force and (is_downloaded(item.key) or dest.exists()):
-                    print(f"Skipping {label} (already downloaded)")
+                existing = None if args.force else existing_download(
+                    item, dest_dir, args.format
+                )
+                if existing is not None:
+                    print(f"Skipping {label} (already downloaded: {existing})")
                     continue
                 print(f"Downloading {label} ({args.format})")
                 try:
@@ -281,9 +290,12 @@ def cmd_download(args: argparse.Namespace) -> int:
                         retries=args.retries,
                         retry_wait=args.retry_wait,
                     )
-                except (BandcampError, OSError) as exc:
+                except (BandcampError, OSError, httpx.HTTPError) as exc:
                     print(f"Failed {label}: {exc}", file=sys.stderr)
                     failures += 1
+                    remaining = pending - index - 1
+                    if remaining and args.delay:
+                        time.sleep(args.delay)
                     continue
                 record_download(
                     item.key,
@@ -301,7 +313,7 @@ def cmd_download(args: argparse.Namespace) -> int:
             print(f"Finished with {failures} failure(s), {downloaded} downloaded.")
             return 1
         return 0
-    except (AuthError, BandcampError, OSError) as exc:
+    except CLI_ERRORS as exc:
         print(exc, file=sys.stderr)
         return 1
 
