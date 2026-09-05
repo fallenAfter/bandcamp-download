@@ -105,6 +105,13 @@ def test_parse_stat_body_rejects_non_json() -> None:
         parse_stat_body("<html>login required</html>")
 
 
+def test_parse_stat_body_ignores_object_literals_in_html() -> None:
+    """A logged-out HTML page can carry JS objects; none of them is the payload."""
+    body = '<html><script>var opts = {"theme":"dark"};</script>Log in to continue</html>'
+    with pytest.raises(BandcampError, match="session may have expired"):
+        parse_stat_body(body)
+
+
 def test_resolve_cdn_url_reports_stat_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

@@ -18,6 +18,7 @@ from bcdl.session import BandcampError, Client, dotted
 
 UNSAFE_FILENAME = re.compile(r'[<>:"/\\|?*]')
 STAT_CALLBACK = re.compile(r"statResult\s*\(")
+STAT_KEYS = ("result", "download_url", "retry_url", "url")
 
 
 def format_order(preferred: str) -> tuple[str, ...]:
@@ -113,6 +114,19 @@ def _balanced_object(text: str, start: int) -> str | None:
     return None
 
 
+def _object_starts(body: str) -> list[int]:
+    """Offsets of `{` worth trying, the one following `statResult(` first."""
+    starts: list[int] = []
+    call = STAT_CALLBACK.search(body)
+    if call:
+        brace = body.find("{", call.end())
+        if brace != -1:
+            starts.append(brace)
+    seen = set(starts)
+    starts.extend(index for index, char in enumerate(body) if char == "{" and index not in seen)
+    return starts
+
+
 def parse_stat_body(text: str) -> dict:
     """Pull the payload out of statdownload's JSONP reply.
 
@@ -121,14 +135,7 @@ def parse_stat_body(text: str) -> dict:
     so the first brace opens the if-block rather than the payload.
     """
     body = text.strip()
-    starts: list[int] = []
-    call = STAT_CALLBACK.search(body)
-    if call:
-        brace = body.find("{", call.end() - 1)
-        if brace != -1:
-            starts.append(brace)
-    starts.extend(index for index, char in enumerate(body) if char == "{")
-    for start in starts:
+    for start in _object_starts(body):
         blob = _balanced_object(body, start)
         if blob is None:
             continue
@@ -136,9 +143,14 @@ def parse_stat_body(text: str) -> dict:
             data = json.loads(blob)
         except json.JSONDecodeError:
             continue
-        if isinstance(data, dict) and data:
+        # Requiring a known key keeps stray object literals in an HTML
+        # error page from being mistaken for the payload.
+        if isinstance(data, dict) and any(key in data for key in STAT_KEYS):
             return data
-    raise BandcampError("statdownload did not return JSON")
+    raise BandcampError(
+        "statdownload did not return a recognisable payload; "
+        "the session may have expired (try `bcdl login`)"
+    )
 
 
 def resolve_cdn_url(client: Client, format_url: str) -> str:
