@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import httpx
+import pytest
 
 from bcdl.collection import Item, find_by_id, find_by_url, normalize_item_url
 from bcdl.download import (
@@ -18,7 +19,7 @@ from bcdl.download import (
     to_stat_url,
 )
 from bcdl.manifest import is_downloaded, record_download
-from bcdl.session import Client
+from bcdl.session import BandcampError, Client
 
 
 def test_format_order_puts_flac_first_by_default() -> None:
@@ -76,6 +77,47 @@ def test_parse_stat_body_strips_js_wrapper() -> None:
     assert parse_stat_body(body)["retry_url"].endswith("file.zip")
 
 
+def test_parse_stat_body_handles_jsonp_if_block() -> None:
+    """The real reply wraps the payload in an if-block, so the first brace is not JSON."""
+    body = (
+        "if ( window.Downloads ) { window.Downloads.statResult( "
+        '{"result":"ok","download_url":"https://p4.bcbits.com/file.zip","retry_url":null} '
+        ") }"
+    )
+    stat = parse_stat_body(body)
+    assert stat["download_url"].endswith("file.zip")
+    assert stat["retry_url"] is None
+
+
+def test_parse_stat_body_handles_plain_json() -> None:
+    assert parse_stat_body('{"result":"ok","download_url":"https://x/f.zip"}')["result"] == "ok"
+
+
+def test_parse_stat_body_ignores_braces_inside_strings() -> None:
+    body = 'statResult({"result":"ok","reason":"a } brace {","download_url":"https://x/f.zip"})'
+    stat = parse_stat_body(body)
+    assert stat["reason"] == "a } brace {"
+    assert stat["download_url"].endswith("f.zip")
+
+
+def test_parse_stat_body_rejects_non_json() -> None:
+    with pytest.raises(BandcampError):
+        parse_stat_body("<html>login required</html>")
+
+
+def test_resolve_cdn_url_reports_stat_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text='if ( window.Downloads ) { window.Downloads.statResult( '
+            '{"result":"err","reason":"not purchased"} ) }',
+        )
+
+    client = Client("token", http=httpx.Client(transport=httpx.MockTransport(handler)))
+    with pytest.raises(BandcampError, match="not purchased"):
+        resolve_cdn_url(client, "https://popplers5.bandcamp.com/download/album?enc=flac&id=1")
+
+
 def test_to_stat_url_swaps_path() -> None:
     url = "https://popplers5.bandcamp.com/download/album?enc=flac&id=1"
     stat = to_stat_url(url)
@@ -109,6 +151,12 @@ def test_track_extension_is_not_zip() -> None:
     assert album_filename(item, "flac").endswith(".flac")
 
 
+def _stat_jsonp(cdn_url: str) -> str:
+    """Mimic the JSONP wrapper Bandcamp actually returns from statdownload."""
+    payload = json.dumps({"result": "ok", "download_url": cdn_url})
+    return f"if ( window.Downloads ) {{ window.Downloads.statResult( {payload} ) }}"
+
+
 def _download_html(format_url: str) -> str:
     blob = {
         "download_items": [
@@ -129,7 +177,7 @@ def test_download_item_writes_zip(tmp_path: Path) -> None:
         if path == "/download":
             return httpx.Response(200, text=_download_html(format_url))
         if path.startswith("/statdownload/"):
-            return httpx.Response(200, text=json.dumps({"retry_url": cdn_url}))
+            return httpx.Response(200, text=_stat_jsonp(cdn_url))
         if path.endswith("album.zip"):
             return httpx.Response(
                 200,
@@ -203,7 +251,7 @@ def test_download_retries_then_succeeds(tmp_path: Path) -> None:
         if path == "/download":
             return httpx.Response(200, text=_download_html(format_url))
         if path.startswith("/statdownload/"):
-            return httpx.Response(200, text=json.dumps({"retry_url": cdn_url}))
+            return httpx.Response(200, text=_stat_jsonp(cdn_url))
         if path.endswith("album.zip"):
             calls["cdn"] += 1
             if calls["cdn"] == 1:
