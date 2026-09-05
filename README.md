@@ -124,6 +124,8 @@ uv run bcdl download --artist "Slowdive" --dry-run
 uv run bcdl download --artist "Slowdive" -o ~/Music/bandcamp-zips
 ```
 
+`--artist` needs to match exactly one artist in your collection; if a partial name matches several, the matches are listed so you can pick one. Merch purchases with no digital download are skipped, as are unreleased preorders (whose ZIP would only hold the tracks out so far). Add `--include-preorders` if you want the partial ones anyway.
+
 Example `albums.txt`:
 
 ```text

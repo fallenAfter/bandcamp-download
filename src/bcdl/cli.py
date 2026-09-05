@@ -154,6 +154,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="List what would be downloaded without fetching files",
     )
     download.add_argument(
+        "--include-preorders",
+        action="store_true",
+        help="Include unreleased preorders when selecting by --artist",
+    )
+    download.add_argument(
         "--force",
         action="store_true",
         help="Re-download even if the album is in the manifest or already on disk",
@@ -315,16 +320,27 @@ def cmd_download(args: argparse.Namespace) -> int:
                 failures += 1
             seen = {item.key for item in selected}
             for item in artist_items:
-                if item.key not in seen:
-                    seen.add(item.key)
-                    selected.append(item)
+                if item.key in seen:
+                    continue
+                # An artist's purchases can include merch with no digital download,
+                # and preorders whose ZIP only holds the tracks released so far.
+                if not item.downloadable:
+                    print(f"Skipping {item.item_title} (no digital download)")
+                    continue
+                if item.is_preorder and not args.include_preorders:
+                    print(
+                        f"Skipping {item.item_title} (unreleased preorder; "
+                        "use --include-preorders)"
+                    )
+                    continue
+                seen.add(item.key)
+                selected.append(item)
             for label in missing:
                 print(f"Not in your collection: {label}", file=sys.stderr)
                 failures += 1
             if not selected:
                 if not failures:
                     print("No matching purchases.", file=sys.stderr)
-                    return 1
                 return 1
             if args.delay == 0 and len(selected) > 1:
                 print(
