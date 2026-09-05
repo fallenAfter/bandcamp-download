@@ -90,6 +90,7 @@ export BCDL_HOME=/var/lib/bcdl
 ```sh
 uv run bcdl list
 uv run bcdl list --search "slowdive"
+uv run bcdl list --artist "Slowdive"
 uv run bcdl list --json
 ```
 
@@ -116,7 +117,14 @@ uv run bcdl download \
 
 # From a text file (URLs or ids, `#` comments allowed)
 uv run bcdl download --file albums.txt -o ~/Music/bandcamp-zips
+
+# Every owned album by one artist (preview first)
+uv run bcdl list --artist "Slowdive"
+uv run bcdl download --artist "Slowdive" --dry-run
+uv run bcdl download --artist "Slowdive" -o ~/Music/bandcamp-zips
 ```
+
+`--artist` needs to match exactly one artist in your collection; if a partial name matches several, the matches are listed so you can pick one. Merch purchases with no digital download are skipped, as are unreleased preorders (whose ZIP would only hold the tracks out so far). Add `--include-preorders` if you want the partial ones anyway.
 
 Example `albums.txt`:
 
@@ -149,7 +157,7 @@ Files are named `{artist} - {album} [{format}].zip`.
 
 ## Rate limits
 
-Downloads are sequential. The default pause between albums is 3 seconds (`--delay`). Failed transfers retry (`--retries`, `--retry-wait`). Do not hammer Bandcamp; these are your purchases, but the endpoints are undocumented and rate-limited.
+Downloads are always one album at a time, including `--artist` discographies. The default pause between albums is 3 seconds (`--delay`). Failed transfers retry (`--retries`, `--retry-wait`), and HTTP 429 responses honour `Retry-After`. Use `--dry-run` to see the queue before fetching. Do not set `--delay 0` on a large artist download.
 
 ## State files
 

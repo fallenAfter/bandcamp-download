@@ -15,6 +15,7 @@ from bcdl.collection import (
     item_from_json,
     load_collection,
     parse_targets_file,
+    resolve_artists,
     resolve_targets,
     save_collection,
 )
@@ -111,6 +112,28 @@ def test_resolve_targets_dedupes_and_reports_missing() -> None:
     )
     assert [i.key for i in found] == ["p1", "p2"]
     assert missing == ["https://missing.bandcamp.com/album/x"]
+
+
+def test_resolve_artists_exact_and_substring() -> None:
+    items = [
+        Item(1, "p", "Slowdive", "Souvlaki", "album", "https://a.bandcamp.com/album/one", "u1"),
+        Item(2, "p", "Slowdive", "Pygmalion", "album", "https://a.bandcamp.com/album/two", "u2"),
+        Item(3, "p", "Slow Crush", "Hush", "album", "https://b.bandcamp.com/album/hush", "u3"),
+    ]
+    found, missing, ambiguous = resolve_artists(items, ["slowdive"])
+    assert missing == []
+    assert ambiguous == {}
+    assert [i.item_title for i in found] == ["Souvlaki", "Pygmalion"]
+
+    found, missing, ambiguous = resolve_artists(items, ["slow"])
+    assert found == []
+    assert missing == []
+    assert ambiguous["slow"] == ["Slow Crush", "Slowdive"]
+
+    found, missing, ambiguous = resolve_artists(items, ["nope"])
+    assert found == []
+    assert missing == ["nope"]
+    assert ambiguous == {}
 
 
 def test_fetch_collection_paginates() -> None:

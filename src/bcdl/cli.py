@@ -26,6 +26,7 @@ from bcdl.collection import (
     fetch_collection,
     filter_items,
     parse_targets_file,
+    resolve_artists,
     resolve_targets,
     save_collection,
 )
@@ -82,6 +83,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Filter by artist or album title",
     )
     list_cmd.add_argument(
+        "--artist",
+        dest="artists",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Show only purchases by this artist (repeatable, case-insensitive)",
+    )
+    list_cmd.add_argument(
         "--json",
         action="store_true",
         help="Print JSON instead of a table",
@@ -125,11 +134,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Preferred audio format (default: flac)",
     )
     download.add_argument(
+        "--artist",
+        dest="artists",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Download every owned album/track by this artist (repeatable)",
+    )
+    download.add_argument(
         "--file",
         dest="from_file",
         metavar="FILE",
         type=Path,
         help="Text file of album URLs or item ids (one per line)",
+    )
+    download.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List what would be downloaded without fetching files",
+    )
+    download.add_argument(
+        "--include-preorders",
+        action="store_true",
+        help="Include unreleased preorders when selecting by --artist",
     )
     download.add_argument(
         "--force",
@@ -182,6 +209,20 @@ def _read_identity(args: argparse.Namespace) -> str:
     return parse_identity(value)
 
 
+def _report_artist_errors(missing: list[str], ambiguous: dict[str, list[str]]) -> bool:
+    ok = True
+    for query, names in ambiguous.items():
+        print(
+            f"--artist {query!r} matches more than one artist: {', '.join(names)}",
+            file=sys.stderr,
+        )
+        ok = False
+    for query in missing:
+        print(f"No owned albums by {query!r}. Try `bcdl list --artist NAME`.", file=sys.stderr)
+        ok = False
+    return ok
+
+
 def cmd_login(args: argparse.Namespace) -> int:
     try:
         identity = _read_identity(args)
@@ -207,6 +248,11 @@ def cmd_list(args: argparse.Namespace) -> int:
         save_collection(items)
         if not args.include_hidden:
             items = [item for item in items if not item.hidden]
+        if args.artists:
+            artist_items, missing, ambiguous = resolve_artists(items, args.artists)
+            if not _report_artist_errors(missing, ambiguous):
+                return 1
+            items = artist_items
         items = filter_items(items, args.search)
         if args.json:
             print(json.dumps([item.to_dict() for item in items], indent=2))
@@ -244,6 +290,7 @@ def cmd_download(args: argparse.Namespace) -> int:
 
     urls = list(args.urls)
     ids = list(args.ids)
+    artists = list(args.artists)
     if args.from_file is not None:
         try:
             file_urls, file_ids = parse_targets_file(args.from_file)
@@ -252,9 +299,9 @@ def cmd_download(args: argparse.Namespace) -> int:
             return 1
         urls.extend(file_urls)
         ids.extend(file_ids)
-    if not urls and not ids:
+    if not urls and not ids and not artists:
         print(
-            "Specify album URL(s), --id, and/or --file with one target per line.",
+            "Specify album URL(s), --id, --artist, and/or --file with one target per line.",
             file=sys.stderr,
         )
         return 2
@@ -268,9 +315,47 @@ def cmd_download(args: argparse.Namespace) -> int:
             catalog = fetch_collection(client, include_hidden=True, page_delay=0.5)
             save_collection(catalog)
             selected, missing = resolve_targets(catalog, urls, ids)
+            artist_items, artist_missing, ambiguous = resolve_artists(catalog, artists)
+            if not _report_artist_errors(artist_missing, ambiguous):
+                failures += 1
+            seen = {item.key for item in selected}
+            for item in artist_items:
+                if item.key in seen:
+                    continue
+                # An artist's purchases can include merch with no digital download,
+                # and preorders whose ZIP only holds the tracks released so far.
+                if not item.downloadable:
+                    print(f"Skipping {item.item_title} (no digital download)")
+                    continue
+                if item.is_preorder and not args.include_preorders:
+                    print(
+                        f"Skipping {item.item_title} (unreleased preorder; "
+                        "use --include-preorders)"
+                    )
+                    continue
+                seen.add(item.key)
+                selected.append(item)
             for label in missing:
                 print(f"Not in your collection: {label}", file=sys.stderr)
                 failures += 1
+            if not selected:
+                if not failures:
+                    print("No matching purchases.", file=sys.stderr)
+                return 1
+            if args.delay == 0 and len(selected) > 1:
+                print(
+                    "Warning: --delay 0 with multiple albums can trigger Bandcamp rate limits.",
+                    file=sys.stderr,
+                )
+            print(
+                f"Selected {len(selected)} owned release(s). "
+                f"Downloads are sequential with a {args.delay:g}s pause between albums."
+            )
+            if args.dry_run:
+                for item in selected:
+                    print(f"  {item.key:<12} {item.band_name} — {item.item_title}")
+                print("Dry run: nothing downloaded.")
+                return 1 if failures else 0
             pending = len(selected)
             for index, item in enumerate(selected):
                 label = f"{item.band_name} — {item.item_title}"
