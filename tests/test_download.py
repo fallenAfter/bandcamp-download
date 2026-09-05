@@ -7,16 +7,15 @@ import pytest
 
 from bcdl.collection import Item, find_by_id, find_by_url, normalize_item_url
 from bcdl.download import (
+    absolute_url,
     album_filename,
     download_item,
     existing_download,
     file_extension,
     format_order,
-    parse_stat_body,
     pick_format,
-    resolve_cdn_url,
     sanitize_filename,
-    to_stat_url,
+    stream_to_file,
 )
 from bcdl.manifest import is_downloaded, record_download
 from bcdl.session import BandcampError, Client
@@ -72,64 +71,9 @@ def test_normalize_and_find() -> None:
     assert find_by_url(items, "https://other.bandcamp.com/album/nope") is None
 
 
-def test_parse_stat_body_strips_js_wrapper() -> None:
-    body = 'foo({"result":"ok","retry_url":"https://p4.bcbits.com/file.zip"})'
-    assert parse_stat_body(body)["retry_url"].endswith("file.zip")
-
-
-def test_parse_stat_body_handles_jsonp_if_block() -> None:
-    """The real reply wraps the payload in an if-block, so the first brace is not JSON."""
-    body = (
-        "if ( window.Downloads ) { window.Downloads.statResult( "
-        '{"result":"ok","download_url":"https://p4.bcbits.com/file.zip","retry_url":null} '
-        ") }"
-    )
-    stat = parse_stat_body(body)
-    assert stat["download_url"].endswith("file.zip")
-    assert stat["retry_url"] is None
-
-
-def test_parse_stat_body_handles_plain_json() -> None:
-    assert parse_stat_body('{"result":"ok","download_url":"https://x/f.zip"}')["result"] == "ok"
-
-
-def test_parse_stat_body_ignores_braces_inside_strings() -> None:
-    body = 'statResult({"result":"ok","reason":"a } brace {","download_url":"https://x/f.zip"})'
-    stat = parse_stat_body(body)
-    assert stat["reason"] == "a } brace {"
-    assert stat["download_url"].endswith("f.zip")
-
-
-def test_parse_stat_body_rejects_non_json() -> None:
-    with pytest.raises(BandcampError):
-        parse_stat_body("<html>login required</html>")
-
-
-def test_parse_stat_body_ignores_object_literals_in_html() -> None:
-    """A logged-out HTML page can carry JS objects; none of them is the payload."""
-    body = '<html><script>var opts = {"theme":"dark"};</script>Log in to continue</html>'
-    with pytest.raises(BandcampError, match="session may have expired"):
-        parse_stat_body(body)
-
-
-def test_resolve_cdn_url_reports_stat_error() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            text='if ( window.Downloads ) { window.Downloads.statResult( '
-            '{"result":"err","reason":"not purchased"} ) }',
-        )
-
-    client = Client("token", http=httpx.Client(transport=httpx.MockTransport(handler)))
-    with pytest.raises(BandcampError, match="not purchased"):
-        resolve_cdn_url(client, "https://popplers5.bandcamp.com/download/album?enc=flac&id=1")
-
-
-def test_to_stat_url_swaps_path() -> None:
-    url = "https://popplers5.bandcamp.com/download/album?enc=flac&id=1"
-    stat = to_stat_url(url)
-    assert "/statdownload/" in stat
-    assert ".rand=" in stat
+def test_absolute_url_upgrades_protocol_relative() -> None:
+    assert absolute_url("//p4.bcbits.com/f.zip") == "https://p4.bcbits.com/f.zip"
+    assert absolute_url("https://p4.bcbits.com/f.zip") == "https://p4.bcbits.com/f.zip"
 
 
 def test_manifest_roundtrip(tmp_path: Path, monkeypatch) -> None:
@@ -158,12 +102,6 @@ def test_track_extension_is_not_zip() -> None:
     assert album_filename(item, "flac").endswith(".flac")
 
 
-def _stat_jsonp(cdn_url: str) -> str:
-    """Mimic the JSONP wrapper Bandcamp actually returns from statdownload."""
-    payload = json.dumps({"result": "ok", "download_url": cdn_url})
-    return f"if ( window.Downloads ) {{ window.Downloads.statResult( {payload} ) }}"
-
-
 def _download_html(format_url: str) -> str:
     blob = {
         "download_items": [
@@ -176,22 +114,21 @@ def _download_html(format_url: str) -> str:
 
 def test_download_item_writes_zip(tmp_path: Path) -> None:
     format_url = "https://popplers5.bandcamp.com/download/album?enc=flac&id=1"
-    cdn_url = "https://p4.bcbits.com/download/album.zip"
     payload = b"PK\x03\x04 fake zip"
+    paths: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        paths.append(path)
         if path == "/download":
             return httpx.Response(200, text=_download_html(format_url))
-        if path.startswith("/statdownload/"):
-            return httpx.Response(200, text=_stat_jsonp(cdn_url))
-        if path.endswith("album.zip"):
+        if path == "/download/album":
             return httpx.Response(
                 200,
                 content=payload,
                 headers={
                     "content-length": str(len(payload)),
-                    "content-disposition": 'attachment; filename="Artist - Album.zip"',
+                    "content-type": "application/zip",
                 },
             )
         return httpx.Response(404, text=str(request.url))
@@ -210,24 +147,29 @@ def test_download_item_writes_zip(tmp_path: Path) -> None:
     assert fmt == "flac"
     assert dest.read_bytes() == payload
     assert dest.name == "Artist - Album [flac].zip"
+    # statdownload is a telemetry ping that returns no URL; we must not need it.
+    assert not any("statdownload" in path for path in paths)
 
 
-def test_resolve_cdn_url_https_prefix() -> None:
+def test_stream_rejects_html_body(tmp_path: Path) -> None:
+    """A page where the file should be means the link is stale or still packaging."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            200, text='({"retry_url":"//p4.bcbits.com/x.zip"})'
+            200,
+            text="<html>Your download is being prepared</html>",
+            headers={"content-type": "text/html; charset=utf-8"},
         )
 
     client = Client("token", http=httpx.Client(transport=httpx.MockTransport(handler)))
-    url = resolve_cdn_url(
-        client, "https://popplers5.bandcamp.com/download/album?enc=flac"
-    )
-    assert url == "https://p4.bcbits.com/x.zip"
+    dest = tmp_path / "album.zip"
+    with pytest.raises(BandcampError, match="web page, not a file"):
+        stream_to_file(client, "https://popplers5.bandcamp.com/download/album", dest)
+    assert not dest.exists()
+    assert not dest.with_suffix(".zip.part").exists()
 
 
 def test_stream_resumes_partial_file(tmp_path: Path) -> None:
-    from bcdl.download import stream_to_file
-
     body = b"ABCDEFGH"
     dest = tmp_path / "album.zip"
     part = tmp_path / "album.zip.part"
@@ -238,7 +180,7 @@ def test_stream_resumes_partial_file(tmp_path: Path) -> None:
         return httpx.Response(
             206,
             content=body[3:],
-            headers={"content-length": "5"},
+            headers={"content-length": "5", "content-type": "application/zip"},
         )
 
     client = Client("token", http=httpx.Client(transport=httpx.MockTransport(handler)))
@@ -249,7 +191,6 @@ def test_stream_resumes_partial_file(tmp_path: Path) -> None:
 
 def test_download_retries_then_succeeds(tmp_path: Path) -> None:
     format_url = "https://popplers5.bandcamp.com/download/album?enc=flac&id=1"
-    cdn_url = "https://p4.bcbits.com/download/album.zip"
     payload = b"PK\x03\x04 ok"
     calls = {"cdn": 0}
 
@@ -257,16 +198,17 @@ def test_download_retries_then_succeeds(tmp_path: Path) -> None:
         path = request.url.path
         if path == "/download":
             return httpx.Response(200, text=_download_html(format_url))
-        if path.startswith("/statdownload/"):
-            return httpx.Response(200, text=_stat_jsonp(cdn_url))
-        if path.endswith("album.zip"):
+        if path == "/download/album":
             calls["cdn"] += 1
             if calls["cdn"] == 1:
                 return httpx.Response(500, text="nope")
             return httpx.Response(
                 200,
                 content=payload,
-                headers={"content-length": str(len(payload))},
+                headers={
+                    "content-length": str(len(payload)),
+                    "content-type": "application/zip",
+                },
             )
         return httpx.Response(404, text=str(request.url))
 
