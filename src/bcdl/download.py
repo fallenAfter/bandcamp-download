@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import json
-import random
 import re
 import time
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 
@@ -17,8 +14,6 @@ from bcdl.manifest import load_manifest
 from bcdl.session import BandcampError, Client, dotted
 
 UNSAFE_FILENAME = re.compile(r'[<>:"/\\|?*]')
-STAT_CALLBACK = re.compile(r"statResult\s*\(")
-STAT_KEYS = ("result", "download_url", "retry_url", "url")
 
 
 def format_order(preferred: str) -> tuple[str, ...]:
@@ -80,90 +75,11 @@ def existing_download(item: Item, dest_dir: Path, preferred: str) -> Path | None
     return None
 
 
-def to_stat_url(url: str) -> str:
-    parsed = urlparse(url)
-    path = parsed.path.replace("/download/", "/statdownload/", 1)
-    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    query[".rand"] = str(int(time.time() * 1000 * random.random()))
-    return urlunparse(parsed._replace(path=path, query=urlencode(query)))
-
-
-def _balanced_object(text: str, start: int) -> str | None:
-    """Slice the brace-balanced object beginning at text[start], ignoring braces in strings."""
-    depth = 0
-    in_string = False
-    escaped = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    return None
-
-
-def _object_starts(body: str) -> list[int]:
-    """Offsets of `{` worth trying, the one following `statResult(` first."""
-    starts: list[int] = []
-    call = STAT_CALLBACK.search(body)
-    if call:
-        brace = body.find("{", call.end())
-        if brace != -1:
-            starts.append(brace)
-    seen = set(starts)
-    starts.extend(index for index, char in enumerate(body) if char == "{" and index not in seen)
-    return starts
-
-
-def parse_stat_body(text: str) -> dict:
-    """Pull the payload out of statdownload's JSONP reply.
-
-    The body is JavaScript, not JSON:
-    `if ( window.Downloads ) { window.Downloads.statResult( {...} ) }`
-    so the first brace opens the if-block rather than the payload.
-    """
-    body = text.strip()
-    for start in _object_starts(body):
-        blob = _balanced_object(body, start)
-        if blob is None:
-            continue
-        try:
-            data = json.loads(blob)
-        except json.JSONDecodeError:
-            continue
-        # Requiring a known key keeps stray object literals in an HTML
-        # error page from being mistaken for the payload.
-        if isinstance(data, dict) and any(key in data for key in STAT_KEYS):
-            return data
-    raise BandcampError(
-        "statdownload did not return a recognisable payload; "
-        "the session may have expired (try `bcdl login`)"
-    )
-
-
-def resolve_cdn_url(client: Client, format_url: str) -> str:
-    if "/download/" not in urlparse(format_url).path:
-        return format_url
-    stat = parse_stat_body(client.get(to_stat_url(format_url)).text)
-    cdn = stat.get("retry_url") or stat.get("download_url")
-    if not cdn:
-        reason = stat.get("reason") or stat.get("message") or stat.get("result") or "unknown"
-        raise BandcampError(f"statdownload gave no download URL (result: {reason})")
-    if cdn.startswith("//"):
-        return f"https:{cdn}"
-    return cdn
+def absolute_url(url: str) -> str:
+    """Bandcamp hands back protocol-relative URLs in places."""
+    if url.startswith("//"):
+        return f"https:{url}"
+    return url
 
 
 def formats_for(client: Client, item: Item) -> dict[str, dict]:
@@ -191,6 +107,16 @@ def stream_to_file(client: Client, url: str, dest: Path) -> None:
         elif response.status_code not in (200, 206):
             response.read()
             raise BandcampError(f"Download failed: HTTP {response.status_code}")
+
+        # A web page here means the file is not being served: the link may be
+        # stale, or Bandcamp may still be packaging the download.
+        content_type = (response.headers.get("content-type") or "").lower()
+        if content_type.startswith("text/") or "html" in content_type:
+            response.read()
+            raise BandcampError(
+                f"Bandcamp returned a web page, not a file (content-type: {content_type}). "
+                "The download may still be being prepared."
+            )
 
         length = response.headers.get("content-length")
         exact_total: int | None = None
@@ -230,10 +156,9 @@ def download_item(
         try:
             available = formats_for(client, item)
             fmt, entry = pick_format(available, preferred_format)
-            cdn_url = resolve_cdn_url(client, entry["url"])
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest = dest_dir / album_filename(item, fmt)
-            stream_to_file(client, cdn_url, dest)
+            stream_to_file(client, absolute_url(entry["url"]), dest)
             return dest, fmt
         except (BandcampError, httpx.HTTPError, OSError) as exc:
             last_error = exc
