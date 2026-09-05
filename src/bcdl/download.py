@@ -17,6 +17,8 @@ from bcdl.manifest import load_manifest
 from bcdl.session import BandcampError, Client, dotted
 
 UNSAFE_FILENAME = re.compile(r'[<>:"/\\|?*]')
+STAT_CALLBACK = re.compile(r"statResult\s*\(")
+STAT_KEYS = ("result", "download_url", "retry_url", "url")
 
 
 def format_order(preferred: str) -> tuple[str, ...]:
@@ -86,12 +88,69 @@ def to_stat_url(url: str) -> str:
     return urlunparse(parsed._replace(path=path, query=urlencode(query)))
 
 
+def _balanced_object(text: str, start: int) -> str | None:
+    """Slice the brace-balanced object beginning at text[start], ignoring braces in strings."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _object_starts(body: str) -> list[int]:
+    """Offsets of `{` worth trying, the one following `statResult(` first."""
+    starts: list[int] = []
+    call = STAT_CALLBACK.search(body)
+    if call:
+        brace = body.find("{", call.end())
+        if brace != -1:
+            starts.append(brace)
+    seen = set(starts)
+    starts.extend(index for index, char in enumerate(body) if char == "{" and index not in seen)
+    return starts
+
+
 def parse_stat_body(text: str) -> dict:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1:
-        raise BandcampError("statdownload did not return JSON")
-    return json.loads(text[start : end + 1])
+    """Pull the payload out of statdownload's JSONP reply.
+
+    The body is JavaScript, not JSON:
+    `if ( window.Downloads ) { window.Downloads.statResult( {...} ) }`
+    so the first brace opens the if-block rather than the payload.
+    """
+    body = text.strip()
+    for start in _object_starts(body):
+        blob = _balanced_object(body, start)
+        if blob is None:
+            continue
+        try:
+            data = json.loads(blob)
+        except json.JSONDecodeError:
+            continue
+        # Requiring a known key keeps stray object literals in an HTML
+        # error page from being mistaken for the payload.
+        if isinstance(data, dict) and any(key in data for key in STAT_KEYS):
+            return data
+    raise BandcampError(
+        "statdownload did not return a recognisable payload; "
+        "the session may have expired (try `bcdl login`)"
+    )
 
 
 def resolve_cdn_url(client: Client, format_url: str) -> str:
@@ -100,7 +159,8 @@ def resolve_cdn_url(client: Client, format_url: str) -> str:
     stat = parse_stat_body(client.get(to_stat_url(format_url)).text)
     cdn = stat.get("retry_url") or stat.get("download_url")
     if not cdn:
-        raise BandcampError("statdownload response had no download URL")
+        reason = stat.get("reason") or stat.get("message") or stat.get("result") or "unknown"
+        raise BandcampError(f"statdownload gave no download URL (result: {reason})")
     if cdn.startswith("//"):
         return f"https:{cdn}"
     return cdn
