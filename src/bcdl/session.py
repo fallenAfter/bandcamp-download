@@ -9,6 +9,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import time
 from html.parser import HTMLParser
 from typing import Any
 
@@ -18,6 +19,7 @@ from bcdl.config import USER_AGENT
 
 SUMMARY_URL = "https://bandcamp.com/api/fan/2/collection_summary"
 COLLECTION_ITEMS_URL = "https://bandcamp.com/api/fancollection/1/collection_items"
+HIDDEN_ITEMS_URL = "https://bandcamp.com/api/fancollection/1/hidden_items"
 
 
 class BandcampError(RuntimeError):
@@ -103,10 +105,7 @@ class Client:
         return int(fan_id), str(username)
 
     def get(self, url: str) -> httpx.Response:
-        response = self.http.get(url)
-        if response.status_code >= 400:
-            raise BandcampError(f"GET {url} -> HTTP {response.status_code}")
-        return response
+        return self._request("GET", url)
 
     def get_json(self, url: str) -> dict[str, Any]:
         response = self.get(url)
@@ -116,9 +115,7 @@ class Client:
             raise SchemaChanged(f"{url} returned non-JSON (HTTP {response.status_code})") from exc
 
     def post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
-        response = self.http.post(url, json=payload)
-        if response.status_code >= 400:
-            raise BandcampError(f"POST {url} -> HTTP {response.status_code}")
+        response = self._request("POST", url, json=payload)
         try:
             return response.json()
         except ValueError as exc:
@@ -126,6 +123,35 @@ class Client:
 
     def pagedata(self, url: str) -> dict[str, Any]:
         return parse_pagedata(self.get(url).text)
+
+    def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        backoff = 2.0
+        last_error: Exception | None = None
+        for attempt in range(5):
+            try:
+                response = self.http.request(method, url, **kwargs)
+            except httpx.HTTPError as exc:
+                last_error = exc
+                if attempt == 4:
+                    raise BandcampError(f"{method} {url} failed: {exc}") from exc
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            if response.status_code == 429 or response.status_code >= 500:
+                retry_after = response.headers.get("retry-after")
+                wait = float(retry_after) if (retry_after or "").isdigit() else backoff
+                if attempt == 4:
+                    raise BandcampError(
+                        f"{method} {url} still failing after retries "
+                        f"(HTTP {response.status_code})"
+                    )
+                time.sleep(wait)
+                backoff *= 2
+                continue
+            if response.status_code >= 400:
+                raise BandcampError(f"{method} {url} -> HTTP {response.status_code}")
+            return response
+        raise BandcampError(f"{method} {url} failed: {last_error}")
 
 
 def whoami(identity: str, *, client: httpx.Client | None = None) -> tuple[int, str]:

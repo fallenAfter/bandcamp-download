@@ -20,7 +20,10 @@ def load_manifest() -> dict[str, Any]:
     path = manifest_path()
     if not path.exists():
         return {"items": {}}
-    data = json.loads(path.read_text())
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return {"items": {}}
     if "items" not in data or not isinstance(data["items"], dict):
         return {"items": {}}
     return data
@@ -53,4 +56,8 @@ def record_download(
 
 
 def is_downloaded(key: str) -> bool:
-    return key in load_manifest().get("items", {})
+    entry = load_manifest().get("items", {}).get(key)
+    if not entry:
+        return False
+    recorded = entry.get("path")
+    return bool(recorded) and Path(recorded).exists()

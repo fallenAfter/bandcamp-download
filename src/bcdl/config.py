@@ -20,6 +20,16 @@ KNOWN_FORMATS = (
     "vorbis",
 )
 DEFAULT_DELAY_SECONDS = 3.0
+FORMAT_EXTENSIONS = {
+    "flac": ".flac",
+    "alac": ".m4a",
+    "wav": ".wav",
+    "aiff-lossless": ".aiff",
+    "mp3-320": ".mp3",
+    "mp3-v0": ".mp3",
+    "aac-hi": ".m4a",
+    "vorbis": ".ogg",
+}
 USER_AGENT = f"{APP_NAME}/0.1 (+https://github.com/fallenAfter/bandcamp-download)"
 
 
@@ -39,5 +49,6 @@ def config_dir() -> Path:
 
 def ensure_config_dir() -> Path:
     path = config_dir()
-    path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o700)
     return path

@@ -49,6 +49,7 @@ def test_parse_cookies_txt_missing(tmp_path: Path) -> None:
 
 def test_save_and_load_identity(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("BCDL_HOME", str(tmp_path))
+    monkeypatch.delenv("BANDCAMP_IDENTITY", raising=False)
     path = save_identity("sess-token")
     assert path.exists()
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -59,8 +60,15 @@ def test_save_and_load_identity(tmp_path: Path, monkeypatch) -> None:
 
 def test_load_identity_missing(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("BCDL_HOME", str(tmp_path))
+    monkeypatch.delenv("BANDCAMP_IDENTITY", raising=False)
     with pytest.raises(AuthError, match="bcdl login"):
         load_identity()
+
+
+def test_load_identity_prefers_env(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("BCDL_HOME", str(tmp_path))
+    monkeypatch.setenv("BANDCAMP_IDENTITY", "from-env")
+    assert load_identity() == "from-env"
 
 
 def test_whoami_success() -> None:
@@ -86,3 +94,22 @@ def test_whoami_expired() -> None:
     with httpx.Client(transport=transport) as client:
         with pytest.raises(BandcampError, match="Not logged in"):
             whoami("token", client=client)
+
+
+def test_client_retries_server_error(monkeypatch) -> None:
+    monkeypatch.setattr("bcdl.session.time.sleep", lambda _seconds: None)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(500, text="nope")
+        return httpx.Response(
+            200,
+            json={"fan_id": 7, "collection_summary": {"username": "retry"}},
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        fan_id, username = whoami("token", client=client)
+    assert (fan_id, username) == (7, "retry")
+    assert calls["n"] == 2

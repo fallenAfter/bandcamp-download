@@ -51,6 +51,12 @@ You will be prompted if you omit `--identity`. A successful login prints your Ba
 
 The cookie is stored at `~/.config/bcdl/cookies.json` with mode `0600`. Treat it as a live login credential: do not commit it or paste it into chat.
 
+`BANDCAMP_IDENTITY` is used by every command, so a headless server can skip the saved file:
+
+```sh
+BANDCAMP_IDENTITY='paste-the-value-here' uv run bcdl list
+```
+
 ### Linux server / headless
 
 Copy the cookie on a machine with a browser, then either:
@@ -89,7 +95,7 @@ uv run bcdl list --json
 
 Each row shows a **KEY** (use with `--id`) and the album URL. Hidden collection items are omitted unless you pass `--include-hidden`.
 
-`list` also writes a local cache used by `download`.
+`list` also writes a local cache. `download` always refreshes your collection before matching URLs so new purchases and download links stay current.
 
 ## Download selected albums
 

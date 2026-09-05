@@ -67,6 +67,9 @@ def save_identity(identity: str) -> Path:
 
 
 def load_identity() -> str:
+    env_value = identity_from_env()
+    if env_value:
+        return env_value
     path = cookie_path()
     if not path.exists():
         raise AuthError(

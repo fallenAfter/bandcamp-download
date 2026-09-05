@@ -8,6 +8,8 @@ from bcdl.collection import Item, find_by_id, find_by_url, normalize_item_url
 from bcdl.download import (
     album_filename,
     download_item,
+    existing_download,
+    file_extension,
     format_order,
     parse_stat_body,
     pick_format,
@@ -83,9 +85,28 @@ def test_to_stat_url_swaps_path() -> None:
 
 def test_manifest_roundtrip(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("BCDL_HOME", str(tmp_path))
+    zip_path = tmp_path / "a.zip"
+    zip_path.write_bytes(b"PK")
     assert is_downloaded("p1") is False
-    record_download("p1", artist="A", title="B", fmt="flac", path="/tmp/a.zip")
+    record_download("p1", artist="A", title="B", fmt="flac", path=str(zip_path))
     assert is_downloaded("p1") is True
+    zip_path.unlink()
+    assert is_downloaded("p1") is False
+
+
+def test_existing_download_finds_fallback_format(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("BCDL_HOME", str(tmp_path))
+    item = Item(1, "p", "Artist", "Album", "album", "https://a.bandcamp.com/album/x", "u")
+    fallback = tmp_path / album_filename(item, "mp3-320")
+    fallback.write_bytes(b"PK")
+    found = existing_download(item, tmp_path, "flac")
+    assert found == fallback
+
+
+def test_track_extension_is_not_zip() -> None:
+    item = Item(1, "t", "Artist", "Song", "track", "https://a.bandcamp.com/track/x", "u")
+    assert file_extension(item, "flac") == ".flac"
+    assert album_filename(item, "flac").endswith(".flac")
 
 
 def _download_html(format_url: str) -> str:

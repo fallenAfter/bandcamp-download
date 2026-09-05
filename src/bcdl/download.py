@@ -12,7 +12,8 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import httpx
 
 from bcdl.collection import Item
-from bcdl.config import FORMAT_PREFERENCE
+from bcdl.config import FORMAT_EXTENSIONS, FORMAT_PREFERENCE, KNOWN_FORMATS
+from bcdl.manifest import load_manifest
 from bcdl.session import BandcampError, Client, dotted
 
 UNSAFE_FILENAME = re.compile(r'[<>:"/\\|?*]')
@@ -45,11 +46,36 @@ def sanitize_filename(name: str) -> str:
     return cleaned or "download"
 
 
-def album_filename(item: Item, fmt: str, extension: str = ".zip") -> str:
+def file_extension(item: Item, fmt: str) -> str:
+    if (item.item_type or "").lower() == "track":
+        return FORMAT_EXTENSIONS.get(fmt, ".zip")
+    return ".zip"
+
+
+def album_filename(item: Item, fmt: str, extension: str | None = None) -> str:
     stem = sanitize_filename(f"{item.band_name} - {item.item_title}")
     if fmt:
         stem = f"{stem} [{fmt}]"
-    return f"{stem}{extension}"
+    return f"{stem}{extension if extension is not None else file_extension(item, fmt)}"
+
+
+def existing_download(item: Item, dest_dir: Path, preferred: str) -> Path | None:
+    """Return a local file for this purchase, if one is still on disk."""
+    seen: set[Path] = set()
+    for fmt in (*format_order(preferred), *KNOWN_FORMATS):
+        path = dest_dir / album_filename(item, fmt)
+        if path in seen:
+            continue
+        seen.add(path)
+        if path.exists():
+            return path
+    entry = load_manifest().get("items", {}).get(item.key) or {}
+    recorded = entry.get("path")
+    if recorded:
+        path = Path(recorded)
+        if path.exists():
+            return path
+    return None
 
 
 def to_stat_url(url: str) -> str:
