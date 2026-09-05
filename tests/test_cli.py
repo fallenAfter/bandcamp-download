@@ -36,4 +36,11 @@ def test_no_command_prints_help(capsys) -> None:
 def test_download_requires_a_selection(capsys) -> None:
     assert main(["download"]) == 2
     err = capsys.readouterr().err
-    assert "Specify album URL" in err
+    assert "--artist" in err
+
+
+def test_download_accepts_artist_flag() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["download", "--artist", "Slowdive", "--dry-run"])
+    assert args.artists == ["Slowdive"]
+    assert args.dry_run is True

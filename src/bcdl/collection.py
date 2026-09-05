@@ -261,3 +261,45 @@ def resolve_targets(
     for value in ids:
         add(find_by_id(items, value), value)
     return found, missing
+
+
+def matching_artist_names(items: list[Item], query: str) -> list[str]:
+    """Exact artist name match first; otherwise unique substring matches."""
+    needle = query.strip().casefold()
+    if not needle:
+        return []
+    names = sorted({item.band_name for item in items if item.band_name}, key=str.casefold)
+    exact = [name for name in names if name.casefold() == needle]
+    if exact:
+        return exact
+    return [name for name in names if needle in name.casefold()]
+
+
+def items_for_artist(items: list[Item], artist_name: str) -> list[Item]:
+    wanted = artist_name.casefold()
+    return [item for item in items if item.band_name.casefold() == wanted]
+
+
+def resolve_artists(
+    items: list[Item],
+    queries: list[str],
+) -> tuple[list[Item], list[str], dict[str, list[str]]]:
+    """Return (found, missing_queries, ambiguous query -> matching names)."""
+    found: list[Item] = []
+    seen: set[str] = set()
+    missing: list[str] = []
+    ambiguous: dict[str, list[str]] = {}
+    for query in queries:
+        names = matching_artist_names(items, query)
+        if not names:
+            missing.append(query)
+            continue
+        if len(names) > 1:
+            ambiguous[query] = names
+            continue
+        for item in items_for_artist(items, names[0]):
+            if item.key in seen:
+                continue
+            seen.add(item.key)
+            found.append(item)
+    return found, missing, ambiguous
